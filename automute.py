@@ -31,7 +31,6 @@ import re
 import signal
 import sys
 import time
-from ctypes import POINTER, cast
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Set, Tuple
 
@@ -154,7 +153,11 @@ class Endpoints:
             dev = coll.Item(i)
             try:
                 iface = dev.Activate(IAudioSessionManager2._iid_, CLSCTX_ALL, None)
-                out.append((dev.GetId(), cast(iface, POINTER(IAudioSessionManager2))))
+                # QueryInterface, NOT ctypes.cast(): cast() does not AddRef, so the cached pointer and
+                # `iface` would each Release the same single reference.  Dropping the cache (every
+                # refresh) then over-released the COM object -> use-after-free -> sporadic
+                # "invalid handle" errors and an access violation inside AUDIOSES.DLL after ~15 min.
+                out.append((dev.GetId(), iface.QueryInterface(IAudioSessionManager2)))
             except COMError as exc:
                 log.debug("skip endpoint: %s", exc)
         return out
@@ -185,10 +188,13 @@ class Watcher:
     def _target_recording(self) -> bool:
         for _dev_id, mgr in self.capture.managers():
             for ctl in iter_sessions(mgr):
-                c2 = ctl.QueryInterface(IAudioSessionControl2)
-                if c2.GetState() != AUDIO_SESSION_STATE_ACTIVE:
-                    continue
-                pid = c2.GetProcessId()
+                try:
+                    c2 = ctl.QueryInterface(IAudioSessionControl2)
+                    if c2.GetState() != AUDIO_SESSION_STATE_ACTIVE:
+                        continue
+                    pid = c2.GetProcessId()
+                except COMError:
+                    continue  # that session expired while we looked at it; the others still count
                 if proc_name(pid) in self.targets:
                     if self.muted_since is None:
                         log.info("mic capture ACTIVE: pid=%d %s", pid, proc_path(pid))
